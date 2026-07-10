@@ -11,7 +11,7 @@ from database import (init_db, add_movie_to_db, get_movie, get_random_movie, get
                       delete_movie_from_db, add_user_to_db, get_users_count, get_referral_count, get_all_users,
                       add_admin_to_db, get_all_admins, delete_admin_from_db)
 
-TOKEN = "8855313774:AAEoKsvi3jzJPAUJO-JI_tv69uXP-qiajzE"
+TOKEN = "8803299842:AAH0tpdo5ZrCDY8xxf5dpRF00UzOpW4vdCw"
 SUPER_ADMIN = 7094369151  # O'chirib bo'lmaydigan Asosiy Yaratuvchi (Siz)
 
 logging.basicConfig(level=logging.INFO)
