@@ -87,6 +87,27 @@ def init_db():
         )
     """)
 
+    # 6. Serial qismlari (har bir kino/serial bir yoki bir necha qismdan iborat bo'lishi mumkin)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id SERIAL PRIMARY KEY,
+            movie_code TEXT NOT NULL,
+            episode_number INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            UNIQUE (movie_code, episode_number)
+        )
+    """)
+
+    # 7. Foydalanuvchining har bir serialda qaysi qismda to'xtaganini eslab qolish
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watch_progress (
+            user_id BIGINT NOT NULL,
+            movie_code TEXT NOT NULL,
+            last_episode INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (user_id, movie_code)
+        )
+    """)
+
     conn.commit()
 
     # Eski bazalarda ustunlar yo'q bo'lishi mumkin (migratsiya)
@@ -96,6 +117,17 @@ def init_db():
     _ensure_column(cursor, conn, "users", "vip_until", "BIGINT DEFAULT 0")
 
     conn.commit()
+
+    # Eski bazada mavjud bo'lgan kinolarning file_id'sini episodes jadvaliga 1-qism sifatida ko'chiramiz
+    # (faqat hali episodes jadvalida yozuvi yo'q kinolar uchun, xavfsiz migratsiya)
+    cursor.execute("""
+        INSERT INTO episodes (movie_code, episode_number, file_id)
+        SELECT code, 1, file_id FROM movies
+        WHERE file_id IS NOT NULL
+        ON CONFLICT (movie_code, episode_number) DO NOTHING
+    """)
+    conn.commit()
+
     cursor.close()
     _put_conn(conn)
 
@@ -278,7 +310,8 @@ def get_all_vip_users():
 # ================= KINOLAR FUNKSIYALARI =================
 
 def add_movie_to_db(code, category, genre, year, title, file_id):
-    """Eslatma: parametrlar tartibi main.py dagi FSM oqimiga mos: code, category, genre, year, title, file_id."""
+    """Kino/serial yozuvini yaratadi va birinchi qismini (episode 1) file_id bilan saqlaydi.
+    Eslatma: parametrlar tartibi main.py dagi FSM oqimiga mos: code, category, genre, year, title, file_id."""
     conn = get_conn()
     cursor = conn.cursor()
     try:
@@ -286,6 +319,11 @@ def add_movie_to_db(code, category, genre, year, title, file_id):
             """INSERT INTO movies (code, title, file_id, category, genre, year, added_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             (str(code), title, file_id, category, genre, year, int(time.time()))
+        )
+        cursor.execute(
+            """INSERT INTO episodes (movie_code, episode_number, file_id)
+               VALUES (%s, 1, %s)""",
+            (str(code), file_id)
         )
         conn.commit()
         success = True
@@ -295,6 +333,128 @@ def add_movie_to_db(code, category, genre, year, title, file_id):
     cursor.close()
     _put_conn(conn)
     return success
+
+
+# ================= SERIAL QISMLARI (EPISODES) =================
+
+def add_episode(movie_code, file_id, episode_number=None):
+    """Berilgan kino kodiga yangi qism qo'shadi.
+    episode_number berilmasa, avtomatik keyingi raqam (oxirgi qism + 1) tanlanadi.
+    Qaytaradi: qo'shilgan qism raqami, yoki None (agar kino kodi mavjud bo'lmasa)."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    code = str(movie_code)
+
+    cursor.execute("SELECT 1 FROM movies WHERE code = %s", (code,))
+    if cursor.fetchone() is None:
+        cursor.close()
+        _put_conn(conn)
+        return None
+
+    if episode_number is None:
+        cursor.execute(
+            "SELECT COALESCE(MAX(episode_number), 0) + 1 FROM episodes WHERE movie_code = %s",
+            (code,)
+        )
+        episode_number = cursor.fetchone()[0]
+
+    cursor.execute(
+        """INSERT INTO episodes (movie_code, episode_number, file_id)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (movie_code, episode_number) DO UPDATE SET file_id = EXCLUDED.file_id""",
+        (code, episode_number, file_id)
+    )
+
+    if episode_number == 1:
+        cursor.execute("UPDATE movies SET file_id = %s WHERE code = %s", (file_id, code))
+
+    conn.commit()
+    cursor.close()
+    _put_conn(conn)
+    return episode_number
+
+
+def get_episodes_count(movie_code):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM episodes WHERE movie_code = %s", (str(movie_code),))
+    count = cursor.fetchone()[0]
+    cursor.close()
+    _put_conn(conn)
+    return count
+
+
+def get_episode(movie_code, episode_number):
+    """Bitta qismning file_id sini qaytaradi, yoki None."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT file_id FROM episodes WHERE movie_code = %s AND episode_number = %s",
+        (str(movie_code), episode_number)
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    _put_conn(conn)
+    return row[0] if row else None
+
+
+def get_all_episode_numbers(movie_code):
+    """Kino/serialning barcha mavjud qism raqamlarini tartiblangan holda qaytaradi."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT episode_number FROM episodes WHERE movie_code = %s ORDER BY episode_number",
+        (str(movie_code),)
+    )
+    numbers = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    _put_conn(conn)
+    return numbers
+
+
+def delete_episode(movie_code, episode_number):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM episodes WHERE movie_code = %s AND episode_number = %s",
+        (str(movie_code), episode_number)
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    cursor.close()
+    _put_conn(conn)
+    return deleted > 0
+
+
+# ================= FOYDALANUVCHI KO'RISH PROGRESSI =================
+
+def save_progress(user_id, movie_code, episode_number):
+    """Foydalanuvchi qaysi serialning qaysi qismini ko'rib turganini eslab qoladi."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO watch_progress (user_id, movie_code, last_episode)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (user_id, movie_code) DO UPDATE SET last_episode = EXCLUDED.last_episode""",
+        (user_id, str(movie_code), episode_number)
+    )
+    conn.commit()
+    cursor.close()
+    _put_conn(conn)
+
+
+def get_progress(user_id, movie_code):
+    """Foydalanuvchining shu serialda oxirgi ko'rgan qismini qaytaradi. Agar hech qachon ko'rmagan bo'lsa, None."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT last_episode FROM watch_progress WHERE user_id = %s AND movie_code = %s",
+        (user_id, str(movie_code))
+    )
+    row = cursor.fetchone()
+    cursor.close()
+    _put_conn(conn)
+    return row[0] if row else None
 
 
 def update_movie_in_db(code, category=None, genre=None, year=None, title=None, file_id=None):
@@ -509,6 +669,8 @@ def delete_movie_from_db(code):
     cursor.execute("DELETE FROM movies WHERE code = %s", (str(code),))
     deleted = cursor.rowcount
     cursor.execute("DELETE FROM movie_reactions WHERE movie_code = %s", (str(code),))
+    cursor.execute("DELETE FROM episodes WHERE movie_code = %s", (str(code),))
+    cursor.execute("DELETE FROM watch_progress WHERE movie_code = %s", (str(code),))
     conn.commit()
     cursor.close()
     _put_conn(conn)
