@@ -473,6 +473,26 @@ async def process_delete_admin_pwd(message: types.Message, state: FSMContext):
 
 
 if __name__ == "__main__":
-    init_db()
-    print("Mega Bot ishga tushdi...")
-    executor.start_polling(dp, skip_updates=True)
+    import os
+from aiogram import executor
+from aiohttp import web
+
+# Barcha dp, bot va handler kodlaringiz yuqorida o'zgarishsiz qoladi
+
+async def handle(request):
+    return web.Response(text="Bot is running 24/7!")
+
+async def on_startup(dp):
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render taqdim etadigan portni avtomatik aniqlash
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server port {port} da muvaffaqiyatli ishga tushdi!")
+
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
