@@ -1,13 +1,36 @@
-import sqlite3
+import os
 import time
+import psycopg2
+import psycopg2.extensions
+from psycopg2 import errors as pg_errors
+from psycopg2.pool import SimpleConnectionPool
 
-DB_NAME = "kinolar.db"
+# Render "Internal Database URL" ni DATABASE_URL nomli environment variable orqali beradi.
+# Masalan: postgresql://user:password@host/dbname
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+_pool = None
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL environment variable topilmadi. "
+                "Render'da PostgreSQL yaratib, uning Internal Database URL manzilini "
+                "DATABASE_URL nomi bilan Environment bo'limiga qo'shing."
+            )
+        _pool = SimpleConnectionPool(1, 10, dsn=DATABASE_URL, sslmode="require")
+    return _pool
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return _get_pool().getconn()
+
+
+def _put_conn(conn):
+    _get_pool().putconn(conn)
 
 
 def init_db():
@@ -26,7 +49,7 @@ def init_db():
             views INTEGER DEFAULT 0,
             likes INTEGER DEFAULT 0,
             dislikes INTEGER DEFAULT 0,
-            added_at INTEGER
+            added_at BIGINT
         )
     """)
 
@@ -41,23 +64,23 @@ def init_db():
     # 3. Foydalanuvchilar jadvali (referal + VIP)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            referrer_id INTEGER,
-            vip_until INTEGER DEFAULT 0
+            user_id BIGINT PRIMARY KEY,
+            referrer_id BIGINT,
+            vip_until BIGINT DEFAULT 0
         )
     """)
 
     # 4. Adminlar jadvali
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_admins (
-            admin_id INTEGER PRIMARY KEY
+            admin_id BIGINT PRIMARY KEY
         )
     """)
 
     # 5. Kim qaysi kinoga like/dislike bosganini saqlaydi (qayta bosishni oldini olish uchun)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS movie_reactions (
-            user_id INTEGER,
+            user_id BIGINT,
             movie_code TEXT,
             reaction TEXT,
             PRIMARY KEY (user_id, movie_code)
@@ -67,21 +90,26 @@ def init_db():
     conn.commit()
 
     # Eski bazalarda ustunlar yo'q bo'lishi mumkin (migratsiya)
-    _ensure_column(cursor, "movies", "likes", "INTEGER DEFAULT 0")
-    _ensure_column(cursor, "movies", "dislikes", "INTEGER DEFAULT 0")
-    _ensure_column(cursor, "movies", "added_at", "INTEGER")
-    _ensure_column(cursor, "users", "vip_until", "INTEGER DEFAULT 0")
+    _ensure_column(cursor, conn, "movies", "likes", "INTEGER DEFAULT 0")
+    _ensure_column(cursor, conn, "movies", "dislikes", "INTEGER DEFAULT 0")
+    _ensure_column(cursor, conn, "movies", "added_at", "BIGINT")
+    _ensure_column(cursor, conn, "users", "vip_until", "BIGINT DEFAULT 0")
 
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
 
 
-def _ensure_column(cursor, table, column, coltype):
+def _ensure_column(cursor, conn, table, column, coltype):
     """Agar ustun mavjud bo'lmasa qo'shadi (eski bazalarni buzmasdan yangilash uchun)."""
-    cursor.execute(f"PRAGMA table_info({table})")
-    existing = [row[1] for row in cursor.fetchall()]
-    if column not in existing:
+    cursor.execute(
+        """SELECT column_name FROM information_schema.columns
+           WHERE table_name = %s AND column_name = %s""",
+        (table, column)
+    )
+    if cursor.fetchone() is None:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        conn.commit()
 
 
 # ================= ADMINLAR =================
@@ -90,12 +118,14 @@ def add_admin_to_db(admin_id):
     conn = get_conn()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO bot_admins (admin_id) VALUES (?)", (admin_id,))
+        cursor.execute("INSERT INTO bot_admins (admin_id) VALUES (%s)", (admin_id,))
         conn.commit()
         success = True
-    except sqlite3.IntegrityError:
+    except pg_errors.UniqueViolation:
+        conn.rollback()
         success = False
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return success
 
 
@@ -104,17 +134,19 @@ def get_all_admins():
     cursor = conn.cursor()
     cursor.execute("SELECT admin_id FROM bot_admins")
     admins = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return admins
 
 
 def delete_admin_from_db(admin_id):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM bot_admins WHERE admin_id = ?", (admin_id,))
+    cursor.execute("DELETE FROM bot_admins WHERE admin_id = %s", (admin_id,))
     deleted = cursor.rowcount
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return deleted > 0
 
 
@@ -125,15 +157,17 @@ def add_user_to_db(user_id, referrer_id=None):
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT INTO users (user_id, referrer_id) VALUES (?, ?)",
+            "INSERT INTO users (user_id, referrer_id) VALUES (%s, %s)",
             (user_id, referrer_id)
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except pg_errors.UniqueViolation:
+        conn.rollback()
         return False
     finally:
-        conn.close()
+        cursor.close()
+        _put_conn(conn)
 
 
 def get_users_count():
@@ -141,16 +175,18 @@ def get_users_count():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(user_id) FROM users")
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
 def get_referral_count(user_id):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(user_id) FROM users WHERE referrer_id = ?", (user_id,))
+    cursor.execute("SELECT COUNT(user_id) FROM users WHERE referrer_id = %s", (user_id,))
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
@@ -159,7 +195,8 @@ def get_all_users():
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
     users = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return users
 
 
@@ -171,40 +208,43 @@ def set_vip(user_id, days):
     conn = get_conn()
     cursor = conn.cursor()
     now = int(time.time())
-    cursor.execute("SELECT vip_until FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT vip_until FROM users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
     if row is None:
         # Agar foydalanuvchi bazada bo'lmasa (hali /start bosmagan), avval qo'shamiz
         cursor.execute(
-            "INSERT INTO users (user_id, referrer_id, vip_until) VALUES (?, NULL, ?)",
+            "INSERT INTO users (user_id, referrer_id, vip_until) VALUES (%s, NULL, %s)",
             (user_id, now + days * 86400)
         )
     else:
         current_until = row[0] or 0
         base = current_until if current_until > now else now
         new_until = base + days * 86400
-        cursor.execute("UPDATE users SET vip_until = ? WHERE user_id = ?", (new_until, user_id))
+        cursor.execute("UPDATE users SET vip_until = %s WHERE user_id = %s", (new_until, user_id))
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return True
 
 
 def remove_vip(user_id):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET vip_until = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("UPDATE users SET vip_until = 0 WHERE user_id = %s", (user_id,))
     updated = cursor.rowcount
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return updated > 0
 
 
 def is_vip(user_id):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT vip_until FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT vip_until FROM users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     if not row or not row[0]:
         return False
     return row[0] > int(time.time())
@@ -214,9 +254,10 @@ def get_vip_until(user_id):
     """VIP tugash vaqtini unix timestamp sifatida qaytaradi, yoki 0 agar VIP bo'lmasa."""
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT vip_until FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT vip_until FROM users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     if not row or not row[0]:
         return 0
     return row[0]
@@ -227,9 +268,10 @@ def get_all_vip_users():
     conn = get_conn()
     cursor = conn.cursor()
     now = int(time.time())
-    cursor.execute("SELECT user_id, vip_until FROM users WHERE vip_until > ?", (now,))
+    cursor.execute("SELECT user_id, vip_until FROM users WHERE vip_until > %s", (now,))
     result = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
@@ -242,14 +284,16 @@ def add_movie_to_db(code, category, genre, year, title, file_id):
     try:
         cursor.execute(
             """INSERT INTO movies (code, title, file_id, category, genre, year, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             (str(code), title, file_id, category, genre, year, int(time.time()))
         )
         conn.commit()
         success = True
-    except sqlite3.IntegrityError:
+    except pg_errors.UniqueViolation:
+        conn.rollback()
         success = False
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return success
 
 
@@ -261,30 +305,32 @@ def update_movie_in_db(code, category=None, genre=None, year=None, title=None, f
     fields = []
     values = []
     if category is not None:
-        fields.append("category = ?")
+        fields.append("category = %s")
         values.append(category)
     if genre is not None:
-        fields.append("genre = ?")
+        fields.append("genre = %s")
         values.append(genre)
     if year is not None:
-        fields.append("year = ?")
+        fields.append("year = %s")
         values.append(year)
     if title is not None:
-        fields.append("title = ?")
+        fields.append("title = %s")
         values.append(title)
     if file_id is not None:
-        fields.append("file_id = ?")
+        fields.append("file_id = %s")
         values.append(file_id)
 
     if not fields:
-        conn.close()
+        cursor.close()
+        _put_conn(conn)
         return False
 
     values.append(str(code))
-    cursor.execute(f"UPDATE movies SET {', '.join(fields)} WHERE code = ?", values)
+    cursor.execute(f"UPDATE movies SET {', '.join(fields)} WHERE code = %s", values)
     updated = cursor.rowcount
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return updated > 0
 
 
@@ -295,14 +341,15 @@ def get_movie(code):
     cursor = conn.cursor()
     cursor.execute(
         """SELECT code, category, genre, year, title, file_id, views, likes, dislikes
-           FROM movies WHERE code = ?""",
+           FROM movies WHERE code = %s""",
         (str(code),)
     )
     result = cursor.fetchone()
     if result:
-        cursor.execute("UPDATE movies SET views = views + 1 WHERE code = ?", (str(code),))
+        cursor.execute("UPDATE movies SET views = views + 1 WHERE code = %s", (str(code),))
         conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
@@ -312,11 +359,12 @@ def get_movie_no_view_increment(code):
     cursor = conn.cursor()
     cursor.execute(
         """SELECT code, category, genre, year, title, file_id, views, likes, dislikes
-           FROM movies WHERE code = ?""",
+           FROM movies WHERE code = %s""",
         (str(code),)
     )
     result = cursor.fetchone()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
@@ -329,9 +377,10 @@ def get_random_movie():
     )
     result = cursor.fetchone()
     if result:
-        cursor.execute("UPDATE movies SET views = views + 1 WHERE code = ?", (result[0],))
+        cursor.execute("UPDATE movies SET views = views + 1 WHERE code = %s", (result[0],))
         conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
@@ -340,11 +389,12 @@ def get_top_movies(limit=10, offset=0):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT code, title, views FROM movies ORDER BY views DESC LIMIT ? OFFSET ?",
+        "SELECT code, title, views FROM movies ORDER BY views DESC LIMIT %s OFFSET %s",
         (limit, offset)
     )
     result = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
@@ -353,7 +403,8 @@ def get_movies_count():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM movies")
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
@@ -362,20 +413,22 @@ def search_movies_by_title(search_text, limit=10, offset=0):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT code, title, category FROM movies WHERE title LIKE ? ORDER BY views DESC LIMIT ? OFFSET ?",
+        "SELECT code, title, category FROM movies WHERE title ILIKE %s ORDER BY views DESC LIMIT %s OFFSET %s",
         (f"%{search_text}%", limit, offset)
     )
     results = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return results
 
 
 def search_movies_count(search_text):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE title LIKE ?", (f"%{search_text}%",))
+    cursor.execute("SELECT COUNT(*) FROM movies WHERE title ILIKE %s", (f"%{search_text}%",))
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
@@ -383,20 +436,22 @@ def get_movies_by_genre(genre, limit=10, offset=0):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT code, title, category FROM movies WHERE genre = ? ORDER BY views DESC LIMIT ? OFFSET ?",
+        "SELECT code, title, category FROM movies WHERE genre = %s ORDER BY views DESC LIMIT %s OFFSET %s",
         (genre, limit, offset)
     )
     results = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return results
 
 
 def get_movies_by_genre_count(genre):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE genre = ?", (genre,))
+    cursor.execute("SELECT COUNT(*) FROM movies WHERE genre = %s", (genre,))
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
@@ -408,7 +463,8 @@ def get_all_genres():
         "SELECT DISTINCT genre FROM movies WHERE genre IS NOT NULL AND genre != '' ORDER BY genre"
     )
     genres = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return genres
 
 
@@ -416,20 +472,22 @@ def get_movies_by_category(category, limit=10, offset=0):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT code, title, category FROM movies WHERE category = ? ORDER BY views DESC LIMIT ? OFFSET ?",
+        "SELECT code, title, category FROM movies WHERE category = %s ORDER BY views DESC LIMIT %s OFFSET %s",
         (category, limit, offset)
     )
     results = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return results
 
 
 def get_movies_by_category_count(category):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE category = ?", (category,))
+    cursor.execute("SELECT COUNT(*) FROM movies WHERE category = %s", (category,))
     count = cursor.fetchone()[0]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return count
 
 
@@ -440,18 +498,20 @@ def get_all_categories():
         "SELECT DISTINCT category FROM movies WHERE category IS NOT NULL AND category != '' ORDER BY category"
     )
     categories = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return categories
 
 
 def delete_movie_from_db(code):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM movies WHERE code = ?", (str(code),))
+    cursor.execute("DELETE FROM movies WHERE code = %s", (str(code),))
     deleted = cursor.rowcount
-    cursor.execute("DELETE FROM movie_reactions WHERE movie_code = ?", (str(code),))
+    cursor.execute("DELETE FROM movie_reactions WHERE movie_code = %s", (str(code),))
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return deleted > 0
 
 
@@ -466,42 +526,43 @@ def react_to_movie(user_id, code, reaction):
     code = str(code)
 
     cursor.execute(
-        "SELECT reaction FROM movie_reactions WHERE user_id = ? AND movie_code = ?",
+        "SELECT reaction FROM movie_reactions WHERE user_id = %s AND movie_code = %s",
         (user_id, code)
     )
     existing = cursor.fetchone()
 
     if existing is None:
         cursor.execute(
-            "INSERT INTO movie_reactions (user_id, movie_code, reaction) VALUES (?, ?, ?)",
+            "INSERT INTO movie_reactions (user_id, movie_code, reaction) VALUES (%s, %s, %s)",
             (user_id, code, reaction)
         )
         column = "likes" if reaction == "like" else "dislikes"
-        cursor.execute(f"UPDATE movies SET {column} = {column} + 1 WHERE code = ?", (code,))
+        cursor.execute(f"UPDATE movies SET {column} = {column} + 1 WHERE code = %s", (code,))
         status = "added"
     elif existing[0] == reaction:
         cursor.execute(
-            "DELETE FROM movie_reactions WHERE user_id = ? AND movie_code = ?",
+            "DELETE FROM movie_reactions WHERE user_id = %s AND movie_code = %s",
             (user_id, code)
         )
         column = "likes" if reaction == "like" else "dislikes"
-        cursor.execute(f"UPDATE movies SET {column} = MAX({column} - 1, 0) WHERE code = ?", (code,))
+        cursor.execute(f"UPDATE movies SET {column} = GREATEST({column} - 1, 0) WHERE code = %s", (code,))
         status = "removed"
     else:
         cursor.execute(
-            "UPDATE movie_reactions SET reaction = ? WHERE user_id = ? AND movie_code = ?",
+            "UPDATE movie_reactions SET reaction = %s WHERE user_id = %s AND movie_code = %s",
             (reaction, user_id, code)
         )
         old_column = "dislikes" if reaction == "like" else "likes"
         new_column = "likes" if reaction == "like" else "dislikes"
-        cursor.execute(f"UPDATE movies SET {old_column} = MAX({old_column} - 1, 0) WHERE code = ?", (code,))
-        cursor.execute(f"UPDATE movies SET {new_column} = {new_column} + 1 WHERE code = ?", (code,))
+        cursor.execute(f"UPDATE movies SET {old_column} = GREATEST({old_column} - 1, 0) WHERE code = %s", (code,))
+        cursor.execute(f"UPDATE movies SET {new_column} = {new_column} + 1 WHERE code = %s", (code,))
         status = "changed"
 
     conn.commit()
-    cursor.execute("SELECT likes, dislikes FROM movies WHERE code = ?", (code,))
+    cursor.execute("SELECT likes, dislikes FROM movies WHERE code = %s", (code,))
     row = cursor.fetchone()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     likes, dislikes = row if row else (0, 0)
     return status, likes, dislikes
 
@@ -510,11 +571,12 @@ def get_user_reaction(user_id, code):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT reaction FROM movie_reactions WHERE user_id = ? AND movie_code = ?",
+        "SELECT reaction FROM movie_reactions WHERE user_id = %s AND movie_code = %s",
         (user_id, str(code))
     )
     row = cursor.fetchone()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return row[0] if row else None
 
 
@@ -525,14 +587,16 @@ def add_channel_to_db(channel_id, channel_url):
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT INTO channels (channel_id, channel_url) VALUES (?, ?)",
+            "INSERT INTO channels (channel_id, channel_url) VALUES (%s, %s)",
             (channel_id, channel_url)
         )
         conn.commit()
         success = True
-    except sqlite3.IntegrityError:
+    except pg_errors.UniqueViolation:
+        conn.rollback()
         success = False
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return success
 
 
@@ -541,15 +605,17 @@ def get_all_channels():
     cursor = conn.cursor()
     cursor.execute("SELECT channel_id, channel_url FROM channels")
     result = cursor.fetchall()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return result
 
 
 def delete_channel_from_db(channel_id):
     conn = get_conn()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+    cursor.execute("DELETE FROM channels WHERE channel_id = %s", (channel_id,))
     deleted = cursor.rowcount
     conn.commit()
-    conn.close()
+    cursor.close()
+    _put_conn(conn)
     return deleted > 0
