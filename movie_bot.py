@@ -23,6 +23,8 @@ from database import (
     add_admin_to_db, get_all_admins, delete_admin_from_db,
     set_vip, remove_vip, is_vip, get_vip_until, get_all_vip_users,
     react_to_movie, get_user_reaction,
+    add_episode, get_episodes_count, get_episode, get_all_episode_numbers,
+    save_progress, get_progress,
 )
 
 # ================= SOZLAMALAR VA ADMINLAR =================
@@ -53,7 +55,13 @@ class AddMovie(StatesGroup):
     waiting_for_genre = State()
     waiting_for_year = State()
     waiting_for_title = State()
-    waiting_for_link = State()
+    waiting_for_link = State()          # 1-qism videosini kutish
+    waiting_for_next_episode = State()  # Keyingi qism kutilayotgan holat (serial rejimida)
+
+
+class AddEpisode(StatesGroup):
+    waiting_for_code = State()
+    waiting_for_video = State()
 
 
 class EditMovie(StatesGroup):
@@ -152,13 +160,48 @@ def get_main_keyboard(is_user_admin=False, user_vip=False):
 
 def get_admin_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add("➕ Kino qo'shish", "✏️ Kinoni tahrirlash")
-    keyboard.add("🗑️ Kinoni o'chirish", "📢 Reklama yuborish")
+    keyboard.add("➕ Kino qo'shish", "🎬 Serialga qism qo'shish")
+    keyboard.add("✏️ Kinoni tahrirlash", "🗑️ Kinoni o'chirish")
+    keyboard.add("📢 Reklama yuborish")
     keyboard.add("➕ Kanal qo'shish", "🗑️ Kanalni o'chirish")
     keyboard.add("👑 VIP berish", "👑 VIP olish")
     keyboard.add("➕ Admin qo'shish", "🗑️ Adminni o'chirish")
     keyboard.add("📊 To'liq Statistika")
     keyboard.add("🔙 Foydalanuvchi paneli")
+    return keyboard
+
+
+def get_finish_or_continue_keyboard():
+    """Kino qo'shish jarayonida (yangi kino qo'shilganda) admin serial qilishni tanlashi uchun."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton(text="➕ Keyingi qism qo'shish", callback_data="addmovie_more"),
+        types.InlineKeyboardButton(text="✅ Tugatish", callback_data="addmovie_done"),
+    )
+    return keyboard
+
+
+def get_episode_nav_keyboard(code, current_ep, total_eps):
+    """Serial ko'rish paytida chiqadigan navigatsiya tugmalari."""
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    row = []
+    if current_ep > 1:
+        row.append(types.InlineKeyboardButton(text="⬅️ Oldingi qism", callback_data=f"ep_{code}_{current_ep-1}"))
+    row.append(types.InlineKeyboardButton(text="📋 Barcha qismlar", callback_data=f"eplist_{code}"))
+    if current_ep < total_eps:
+        row.append(types.InlineKeyboardButton(text="Keyingi qism ➡️", callback_data=f"ep_{code}_{current_ep+1}"))
+    keyboard.add(*row)
+    return keyboard
+
+
+def get_episode_list_keyboard(code, total_eps, current_ep=None):
+    """Barcha qismlarni ko'rsatadigan tugmalar ro'yxati (4 tadan qatorda)."""
+    keyboard = types.InlineKeyboardMarkup(row_width=4)
+    buttons = []
+    for ep in range(1, total_eps + 1):
+        label = f"• {ep} •" if ep == current_ep else str(ep)
+        buttons.append(types.InlineKeyboardButton(text=label, callback_data=f"ep_{code}_{ep}"))
+    keyboard.add(*buttons)
     return keyboard
 
 
@@ -227,13 +270,17 @@ def get_edit_field_keyboard():
 
 
 # ================= YORDAMCHI: KINO CAPTION =================
-def build_movie_caption(movie):
+def build_movie_caption(movie, episode_num=None, total_eps=1):
     """movie: (code, category, genre, year, title, file_id, views, likes, dislikes) — get_movie natijasi."""
-    code, category, genre, year, title, file_id = movie[0], movie[1], movie[2], movie[3], movie[4], movie[5]
+    code, category, genre, year, title = movie[0], movie[1], movie[2], movie[3], movie[4]
     views = movie[6] if len(movie) > 6 else 0
+    episode_line = ""
+    if total_eps and total_eps > 1 and episode_num:
+        episode_line = f"🎞 <b>Qism:</b> {episode_num}/{total_eps}\n"
     return (
         f"🎬 <b>{esc(title)}</b>\n\n"
         f"🔢 <b>Kino kodi:</b> <code>{esc(code)}</code>\n"
+        f"{episode_line}"
         f"🏷 <b>Kategoriya:</b> {esc(category)}\n"
         f"🎭 <b>Janr:</b> {esc(genre)}\n"
         f"📅 <b>Yil:</b> {esc(year)}\n"
@@ -242,15 +289,40 @@ def build_movie_caption(movie):
     )
 
 
-async def send_movie(chat_id, movie, reply_markup_below=None):
-    """Kinoni video sifatida, like/dislike tugmalari bilan yuboradi."""
+async def send_movie(chat_id, movie, reply_markup_below=None, episode_num=None):
+    """Kinoni/serial qismini video sifatida, like/dislike va (agar serial bo'lsa) navigatsiya tugmalari bilan yuboradi.
+    episode_num berilmasa, oxirgi ko'rilgan qismdan (yoki 1-qismdan) boshlanadi."""
     code = movie[0]
     likes = movie[7] if len(movie) > 7 else 0
     dislikes = movie[8] if len(movie) > 8 else 0
+
+    total_eps = get_episodes_count(code)
+    if total_eps < 1:
+        total_eps = 1  # xavfsizlik uchun, hech qachon bo'lmasligi kerak
+
+    if episode_num is None:
+        saved = get_progress(chat_id, code)
+        episode_num = saved if (saved and 1 <= saved <= total_eps) else 1
+
+    # Tanlangan qism uchun file_id ni olamiz (agar topilmasa 1-qismga qaytamiz)
+    file_id = get_episode(code, episode_num)
+    if file_id is None:
+        episode_num = 1
+        file_id = get_episode(code, 1) or movie[5]
+
+    save_progress(chat_id, code, episode_num)
+
     user_reaction = get_user_reaction(chat_id, code)
-    caption = build_movie_caption(movie)
+    caption = build_movie_caption(movie, episode_num=episode_num, total_eps=total_eps)
+
     reaction_kb = get_movie_reaction_keyboard(code, likes, dislikes, user_reaction)
-    await bot.send_video(chat_id=chat_id, video=movie[5], caption=caption, reply_markup=reaction_kb)
+    if total_eps > 1:
+        nav_kb = get_episode_nav_keyboard(code, episode_num, total_eps)
+        # Reaksiya va navigatsiya tugmalarini bitta klaviaturaga birlashtiramiz
+        for row in nav_kb.inline_keyboard:
+            reaction_kb.add(*row)
+
+    await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=reaction_kb)
     if reply_markup_below is not None:
         await bot.send_message(chat_id=chat_id, text="👇", reply_markup=reply_markup_below)
 
@@ -320,6 +392,65 @@ async def cb_check_sub(call: types.CallbackQuery):
 @dp.callback_query_handler(text="noop")
 async def cb_noop(call: types.CallbackQuery):
     await call.answer()
+
+
+# ================= SERIAL QISMLARI: NAVIGATSIYA =================
+@dp.callback_query_handler(lambda c: c.data.startswith("ep_"))
+async def cb_episode_nav(call: types.CallbackQuery):
+    """Format: ep_<code>_<episode_number> — 'Oldingi/Keyingi qism' yoki ro'yxatdan tanlangan qism."""
+    parts = call.data.split("_")
+    code = parts[1]
+    episode_num = int(parts[2])
+
+    movie = get_movie_no_view_increment(code)
+    if not movie:
+        return await call.answer("❌ Bu kino topilmadi.", show_alert=True)
+
+    await call.answer()
+
+    total_eps = get_episodes_count(code)
+    file_id = get_episode(code, episode_num)
+    if file_id is None:
+        return await call.answer("❌ Bu qism topilmadi.", show_alert=True)
+
+    save_progress(call.from_user.id, code, episode_num)
+    caption = build_movie_caption(movie, episode_num=episode_num, total_eps=total_eps)
+
+    likes = movie[7] if len(movie) > 7 else 0
+    dislikes = movie[8] if len(movie) > 8 else 0
+    user_reaction = get_user_reaction(call.from_user.id, code)
+    reaction_kb = get_movie_reaction_keyboard(code, likes, dislikes, user_reaction)
+    nav_kb = get_episode_nav_keyboard(code, episode_num, total_eps)
+    for row in nav_kb.inline_keyboard:
+        reaction_kb.add(*row)
+
+    try:
+        # Video xabarini tahrirlab, yangi qismni shu joyning o'zida ko'rsatamiz
+        await call.message.edit_media(
+            media=types.InputMediaVideo(media=file_id, caption=caption, parse_mode=types.ParseMode.HTML),
+            reply_markup=reaction_kb
+        )
+    except Exception:
+        # Agar tahrirlash imkonsiz bo'lsa (masalan juda eski xabar), yangi xabar yuboramiz
+        await bot.send_video(chat_id=call.message.chat.id, video=file_id, caption=caption, reply_markup=reaction_kb)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("eplist_"))
+async def cb_episode_list(call: types.CallbackQuery):
+    """«Barcha qismlar» tugmasi bosilganda qismlar ro'yxatini ko'rsatadi."""
+    code = call.data[len("eplist_"):]
+    total_eps = get_episodes_count(code)
+    current_ep = get_progress(call.from_user.id, code) or 1
+    await call.answer()
+    list_kb = get_episode_list_keyboard(code, total_eps, current_ep)
+    try:
+        await bot.send_message(
+            call.from_user.id,
+            f"<b>📋 Barcha qismlar (jami {total_eps} ta):</b>\nKerakli qismni tanlang:",
+            reply_markup=list_kb
+        )
+    except Exception:
+        pass
 
 
 # Admin panelga kirish
@@ -619,18 +750,116 @@ async def process_title(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=AddMovie.waiting_for_link, content_types=['video', 'document'])
 async def process_video(message: types.Message, state: FSMContext):
+    """1-qism uchun ham, keyingi qismlar uchun ham ishlatiladi (state ma'lumotidagi 'episode_count' bo'yicha farqlanadi)."""
     file_id = message.video.file_id if message.video else message.document.file_id
     data = await state.get_data()
-    success = add_movie_to_db(data['code'], data['category'], data['genre'], data['year'], data['title'], file_id)
-    await state.finish()
-    if success:
-        await message.answer("<b>✅ Kino muvaffaqiyatli bazaga yuklandi!</b>", reply_markup=get_admin_keyboard())
+    code = data['code']
+
+    if 'episode_count' not in data:
+        # Bu birinchi qism — kinoni to'liq metadata bilan bazaga yozamiz
+        success = add_movie_to_db(code, data['category'], data['genre'], data['year'], data['title'], file_id)
+        if not success:
+            await state.finish()
+            return await message.answer(
+                "<b>❌ Xatolik: bu kod band bo'lib qoldi. Qaytadan urinib ko'ring.</b>",
+                reply_markup=get_admin_keyboard()
+            )
+        episode_count = 1
     else:
-        await message.answer("<b>❌ Xatolik: bu kod band bo'lib qoldi. Qaytadan urinib ko'ring.</b>", reply_markup=get_admin_keyboard())
+        # Bu keyingi qism — mavjud kino kodiga qo'shamiz
+        ep_num = add_episode(code, file_id)
+        episode_count = ep_num if ep_num else data.get('episode_count', 1)
+
+    await state.update_data(episode_count=episode_count)
+    await message.answer(
+        f"<b>✅ {episode_count}-qism bazaga yuklandi!</b>\n\n"
+        f"Yana keyingi qism qo'shasizmi, yoki shu bilan tugatasizmi?",
+        reply_markup=get_finish_or_continue_keyboard()
+    )
+    await AddMovie.waiting_for_next_episode.set()
 
 
 @dp.message_handler(state=AddMovie.waiting_for_link, content_types=types.ContentType.ANY)
 async def process_video_wrong_type(message: types.Message, state: FSMContext):
+    await message.answer("⚠️ Iltimos, video yoki hujjat (document) shaklida yuboring.")
+
+
+@dp.callback_query_handler(text="addmovie_more", state=AddMovie.waiting_for_next_episode)
+async def cb_addmovie_more(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup()
+    except Exception:
+        pass
+    await bot.send_message(call.from_user.id, "<b>🎥 Keyingi qism videosini (yoki document) yuboring:</b>")
+    await AddMovie.waiting_for_link.set()
+
+
+@dp.callback_query_handler(text="addmovie_done", state=AddMovie.waiting_for_next_episode)
+async def cb_addmovie_done(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    episode_count = data.get('episode_count', 1)
+    await state.finish()
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup()
+    except Exception:
+        pass
+    if episode_count > 1:
+        text = f"<b>✅ Serial saqlandi!</b> Jami <b>{episode_count} qism</b> yuklandi."
+    else:
+        text = "<b>✅ Kino muvaffaqiyatli saqlandi!</b>"
+    await bot.send_message(call.from_user.id, text, reply_markup=get_admin_keyboard())
+
+
+# ================= ADMIN: SERIALGA QISM QO'SHISH =================
+@dp.message_handler(lambda message: message.text == "🎬 Serialga qism qo'shish")
+async def start_add_episode(message: types.Message):
+    if await is_admin(message.from_user.id):
+        await message.answer(
+            "<b>🎬 Qism qo'shmoqchi bo'lgan kino/serial kodini kiriting:</b>",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        await AddEpisode.waiting_for_code.set()
+
+
+@dp.message_handler(state=AddEpisode.waiting_for_code)
+async def process_add_episode_code(message: types.Message, state: FSMContext):
+    movie = get_movie_no_view_increment(message.text)
+    if not movie:
+        return await message.answer("❌ Bu kod bo'yicha kino topilmadi. Qaytadan kiriting:")
+    code = message.text
+    current_count = get_episodes_count(code)
+    await state.update_data(code=code)
+    await message.answer(
+        f"<b>«{esc(movie[4])}»</b> — hozircha <b>{current_count} qism</b> mavjud.\n\n"
+        f"<b>🎥 Yangi qism videosini (yoki document) yuboring:</b>\n"
+        f"<i>(Yangi qism {current_count + 1}-qism sifatida qo'shiladi)</i>"
+    )
+    await AddEpisode.waiting_for_video.set()
+
+
+@dp.message_handler(state=AddEpisode.waiting_for_video, content_types=['video', 'document'])
+async def process_add_episode_video(message: types.Message, state: FSMContext):
+    file_id = message.video.file_id if message.video else message.document.file_id
+    data = await state.get_data()
+    code = data['code']
+    ep_num = add_episode(code, file_id)
+    await state.finish()
+    if ep_num:
+        await message.answer(
+            f"<b>✅ {ep_num}-qism muvaffaqiyatli qo'shildi!</b>",
+            reply_markup=get_admin_keyboard()
+        )
+    else:
+        await message.answer(
+            "<b>❌ Xatolik: bu kino kodi topilmadi.</b>",
+            reply_markup=get_admin_keyboard()
+        )
+
+
+@dp.message_handler(state=AddEpisode.waiting_for_video, content_types=types.ContentType.ANY)
+async def process_add_episode_wrong_type(message: types.Message, state: FSMContext):
     await message.answer("⚠️ Iltimos, video yoki hujjat (document) shaklida yuboring.")
 
 
@@ -704,12 +933,14 @@ async def process_edit_video(message: types.Message, state: FSMContext):
     file_id = message.video.file_id if message.video else message.document.file_id
     data = await state.get_data()
     code = data['code']
-    update_movie_in_db(code, file_id=file_id)
+    # 1-qismni yangilaymiz (bu ham movies.file_id, ham episodes jadvalidagi 1-qismni yangilaydi)
+    add_episode(code, file_id, episode_number=1)
 
     movie = get_movie_no_view_increment(code)
-    caption = build_movie_caption(movie)
+    total_eps = get_episodes_count(code)
+    caption = build_movie_caption(movie, episode_num=1, total_eps=total_eps)
     await message.answer(
-        f"<b>✅ Video yangilandi!</b>\n\n{caption}\n\n<b>Yana biror maydonni o'zgartirasizmi?</b>",
+        f"<b>✅ 1-qism video yangilandi!</b>\n\n{caption}\n\n<b>Yana biror maydonni o'zgartirasizmi?</b>",
         reply_markup=get_edit_field_keyboard()
     )
     await EditMovie.waiting_for_field.set()
